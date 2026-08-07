@@ -35,15 +35,16 @@
 | --- | --- | --- | --- |
 | 하드웨어 | 보드 | Raspberry Pi 5 (4GB, 신규 구매 시 8GB 권장) | 메인 서버 |
 | | 저장장치 | M.2 NVMe SSD (1TB+) + PCIe HAT | MicroSD 사용 불가 |
-| | 백업장치 | 외장 HDD (야간 자동 백업) | **필수** |
+| | 백업장치 | Google Drive (rclone+crypt) / 추후 외장 HDD 추가 | **필수** |
 | | 냉각 | 정품 액티브 쿨러 | 24/7 운용 |
 | | 전원 | 소형 UPS (권장) | 정전 시 DB 손상 방지 |
-| 소프트웨어 | OS | Raspberry Pi OS (64-bit) | |
+| 소프트웨어 | OS | Ubuntu Server 24.04 LTS (64-bit, 헤드리스) | snapd 제거로 RAM 확보 |
 | | 인프라 | Docker & Docker Compose | 앱 격리 및 백업 편의 |
 | | 네트워크 | Tailscale 또는 Cloudflare Tunnel | 공인 IP 불필요 |
 
 ### 4GB RAM 운용 지침
 
+- `sudo apt purge snapd` 로 snapd 제거 (수백 MB RAM 확보)
 - Celery/Redis 미사용 → FastAPI BackgroundTasks + 단순 작업 잠금(lock)
 - PostgreSQL `shared_buffers` 256MB 제한
 - Next.js standalone 빌드
@@ -164,12 +165,17 @@ CREATE TABLE archive_items (
 
 | 계층 | 방법 | 주기 |
 | --- | --- | --- |
-| 1차 (로컬) | 외장 HDD로 rsync/borgbackup 자동 백업 | 매일 야간 |
-| 2차 (오프사이트) | rclone → 클라우드 (Backblaze B2 등), **클라이언트 측 암호화 필수** | 매일 야간 |
+| 오프사이트 (기본) | rclone **crypt** → Google Drive (Google One 용량 요금제 확인) | 매일 야간 |
+| 로컬 (확장) | 데이터 수십 GB 초과 시 외장 HDD(rsync/borg) 추가 | 매일 야간 |
 | DB | `pg_dump` 덤프를 위 백업에 포함 | 매일 야간 |
 
-- 백업 대상: `raw_archives/`, `trained_models/`, DB 덤프. (`ai_processed/`는 재생성 가능하므로 제외 가능)
-- 월 1회 복원 테스트로 백업 유효성 검증.
+### Google Drive 백업 운용 규칙
+
+- **암호화 필수:** rclone `crypt` 리모트로 파일명 포함 클라이언트 측 암호화. 암호화 비밀번호는 서버 외부(종이/패스워드 매니저)에 별도 보관 — 분실 시 백업 전체 복원 불가.
+- **아카이브 후 업로드:** 작은 파일 수천 개를 개별 업로드하지 않는다. 야간 배치에서 `raw_archives/` 증분 + `pg_dump`를 날짜별 `tar.zst`로 묶어 큰 파일 단위로 업로드 (API 레이트 리밋 회피).
+- **헤드리스 인증:** PC에서 `rclone config`로 OAuth 토큰 발급 후 라즈베리파이의 `~/.config/rclone/rclone.conf`로 복사.
+- 백업 대상: `raw_archives/`, `trained_models/`, DB 덤프. (`ai_processed/`는 재생성 가능하므로 제외)
+- 월 1회 복원 테스트로 백업 유효성 검증. 계정 잠금 리스크에 대비해 데이터가 커지면 로컬 HDD 계층을 추가한다.
 
 ---
 
@@ -180,10 +186,13 @@ CREATE TABLE archive_items (
 ```
 
 ### Phase 1 — 하드웨어 및 OS 인프라
-1. PCIe HAT + NVMe SSD 장착, NVMe Gen3 활성화, SSD 부팅 설정
-2. Docker & Docker Compose 설치
-3. Tailscale로 가족 전용 가상 폐쇄망 구축
-4. **백업 체계 구축 (외장 HDD + 클라우드 오프사이트) — 이 단계에서 완료**
+1. PCIe HAT + NVMe SSD 장착. Ubuntu Server 24.04 LTS (64-bit) 설치
+2. Pi 5 부트로더(EEPROM) 최신화 및 NVMe 부팅 순서 설정
+3. NVMe Gen3 활성화: `/boot/firmware/config.txt`에 `dtparam=pciex1_gen=3` 추가
+4. `sudo apt purge snapd` 등 불필요 서비스 제거 (RAM 확보)
+5. Docker & Docker Compose 설치
+6. Tailscale로 가족 전용 가상 폐쇄망 구축
+7. **백업 체계 구축 (rclone crypt → Google Drive, 야간 cron) — 이 단계에서 완료**
 
 ### Phase 2 — DB 및 전처리 모듈
 1. Docker Compose로 PostgreSQL(+pgvector) 실행
@@ -228,7 +237,9 @@ CREATE TABLE archive_items (
 
 ## 8. 운영 체크리스트
 
-- [ ] 백업 자동화 + 월 1회 복원 테스트
+- [ ] 백업 자동화(rclone crypt→Google Drive) + 월 1회 복원 테스트
+- [ ] rclone crypt 비밀번호 오프라인 별도 보관
+- [ ] Google One 용량 잔여분 분기별 확인 / 수십 GB 초과 시 외장 HDD 계층 추가
 - [ ] Groq 데이터 정책 확인 및 가족 공지, 무료 티어 조건 분기별 재확인
 - [ ] `stt_confidence` 하위 항목 월간 리포트 → 재전사 여부 결정
 - [ ] 임베딩 모델 확정 (OpenAI 1536 vs BGE-M3 1024) 후 vector 차원 반영
