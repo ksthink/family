@@ -1,248 +1,373 @@
-# 🏠 Family Archive — 라즈베리파이 5 기반 AI-Ready 가족 아카이브 시스템
+# 🏠 Family Archive — AI-Ready 가족 아카이브 플랫폼
 
-라즈베리파이 5를 저전력 24시간 **수집·정제 서버**로 활용하고, 수집된 데이터를 클라우드 GPU에서 AI 페르소나(LLM, Voice Cloning, Avatar)로 즉시 학습시킬 수 있도록 설계된 시스템입니다.
+가족의 기록(텍스트·이미지·동영상·음성)을 수집·보존하는 **아카이브 사이트**이자, 그 자료를 향후 구성원별 **페르소나 AI** 학습에 그대로 쓸 수 있는 형태로 구조화하는 데이터 플랫폼입니다.
 
-> **핵심 원칙**
-> 1. 라즈베리파이는 "수집과 전처리"만 담당한다. 학습은 클라우드 GPU가 담당한다.
-> 2. PostgreSQL이 유일한 원본(Source of Truth)이다. CSV/JSONL은 Export 시점에 생성한다.
-> 3. 무압축 원본을 마스터로 보존한다. 모델별 포맷은 Export 시 프리셋으로 변환한다.
-> 4. 데이터는 대체 불가능하다. 백업은 기능이 아니라 전제 조건이다.
-
----
-
-## 1. 시스템 아키텍처
-
-```
-[사용자 (가족)]
-       │ (스마트폰/PC 웹 접속)
-       ▼
-[Caddy / Tailscale (보안 라우팅)]
-       │
-       ▼
-[Next.js 프론트엔드] ───► [FastAPI 백엔드]
-                              │
-               ┌──────────────┼────────────────────┐
-               ▼              ▼                    ▼
-       [PostgreSQL+pgvector] [Storage (NVMe)]  [전처리 엔진]
-        (메타데이터/임베딩)   (원본/정제 미디어)   ├─ Groq STT API (기본)
-                                               ├─ whisper.cpp (폴백)
-                                               └─ ffmpeg / Silero VAD
-```
-
-### 하드웨어 / 소프트웨어 구성
-
-| 구분 | 요소 | 구성 상세 | 비고 |
-| --- | --- | --- | --- |
-| 하드웨어 | 보드 | Raspberry Pi 5 (4GB, 신규 구매 시 8GB 권장) | 메인 서버 |
-| | 저장장치 | M.2 NVMe SSD (1TB+) + PCIe HAT | MicroSD 사용 불가 |
-| | 백업장치 | Google Drive (rclone+crypt) / 추후 외장 HDD 추가 | **필수** |
-| | 냉각 | 정품 액티브 쿨러 | 24/7 운용 |
-| | 전원 | 소형 UPS (권장) | 정전 시 DB 손상 방지 |
-| 소프트웨어 | OS | Ubuntu Server 24.04 LTS (64-bit, 헤드리스) | snapd 제거로 RAM 확보 |
-| | 인프라 | Docker & Docker Compose | 앱 격리 및 백업 편의 |
-| | 네트워크 | Tailscale 또는 Cloudflare Tunnel | 공인 IP 불필요 |
-
-### 4GB RAM 운용 지침
-
-- `sudo apt purge snapd` 로 snapd 제거 (수백 MB RAM 확보)
-- Celery/Redis 미사용 → FastAPI BackgroundTasks + 단순 작업 잠금(lock)
-- PostgreSQL `shared_buffers` 256MB 제한
-- Next.js standalone 빌드
-- 로컬 STT(폴백) 실행 중에는 다른 무거운 작업 차단
+> **이 프로젝트의 범위**
+> 본 시스템은 AI 페르소나 제작의 **전 단계**, 즉 **수집·정제·구조화 계층**을 담당합니다.
+> 모델 학습과 실시간 추론은 별도 환경(클라우드 GPU 또는 추후 도입할 추론 서버)에서 수행합니다.
+> 따라서 서버는 고사양일 필요가 없으며, 저전력 24시간 운용에 최적화합니다.
 
 ---
 
-## 2. 저장 구조 (NVMe SSD)
+## 1. 설계 원칙
 
-```
-/mnt/nvme/data/
-├── raw_archives/                  # 무압축 원본 = 유일한 마스터
-│   ├── audio/                     #   (44.1/48kHz 원본 그대로)
-│   ├── images/
-│   └── text/
-├── ai_processed/                  # Export 결과물 캐시 (DB에서 생성)
-│   ├── voice_dataset/
-│   │   ├── preset_gptsovits/      # 32kHz — GPT-SoVITS용
-│   │   ├── preset_xtts/           # 24kHz — XTTS용
-│   │   └── metadata.csv           # [파일명|대본|화자ID|감정태그]
-│   ├── llm_dataset/
-│   │   ├── train_{speaker}.jsonl  # 파인튜닝용 대화 데이터
-│   │   └── memory_rag.json        # RAG용 벡터 원본
-│   └── lora_dataset/              # 이미지 + .txt 캡션 쌍
-└── trained_models/                # 학습 완료된 모델 가중치 (백업 1순위)
-    └── {speaker_id}/
-        └── v{YYYY}Q{n}_{model}/
-            ├── model_weights/
-            ├── training_manifest.json
-            └── samples/
-```
-
-- PostgreSQL 데이터는 Docker 볼륨으로 관리하고 `pg_dump`로 백업한다 (단일 파일 아님).
-- `ai_processed/`는 언제든 DB + 원본에서 재생성 가능한 캐시로 취급한다.
+1. **두 개의 얼굴.** 가족에게는 평범한 아카이브 사이트로 보이고, 내부적으로는 AI 학습용 데이터셋이 함께 쌓인다. 사용자는 데이터셋을 만들고 있다는 것을 의식하지 않는다.
+2. **한 번의 입력, 두 가지 쓰임.** 인물·연도·장소 태그는 아카이브 브라우징에도 쓰이고 동시에 학습 메타데이터가 된다. 학습 전용 입력을 따로 요구하지 않는다.
+3. **PostgreSQL이 유일한 원본(Source of Truth).** CSV/JSONL 등 학습용 산출물은 Export 시점에 DB에서 생성하는 파생물이다.
+4. **무압축 원본 보존.** 모델별 포맷(샘플레이트 등)은 Export 시 프리셋으로 변환한다. 특정 모델 규격을 마스터로 삼지 않는다.
+5. **수집 서버와 추론 서버를 분리한다.** 한 대에 합치지 않는다. 대화형 AI가 필요해지는 시점에 별도 머신을 추가한다.
+6. **데이터는 대체 불가능하다.** 백업은 기능이 아니라 전제 조건이다.
 
 ---
 
-## 3. 데이터베이스 설계 (PostgreSQL + pgvector)
+## 2. 시스템 아키텍처
+
+```
+[가족 사용자]
+     │ 스마트폰 / PC 웹 접속
+     ▼
+[Tailscale / Cloudflare Tunnel]  ← 공인 IP 불필요, 가족 전용 폐쇄망
+     ▼
+[Caddy] → [Next.js 프론트엔드] → [FastAPI 백엔드]
+                                       │
+        ┌──────────────────────────────┼───────────────────────────┐
+        ▼                              ▼                           ▼
+[PostgreSQL + pgvector]        [Storage (USB SSD/HDD)]      [전처리 엔진]
+  메타데이터 · 태그 · 임베딩      원본 미디어 · 파생물          ├─ ffmpeg (변환/오디오 추출)
+                                                             ├─ Silero VAD
+                                                             ├─ Groq STT API (기본)
+                                                             └─ whisper.cpp (폴백)
+```
+
+### 하드웨어
+
+| 구분 | 구성 | 비고 |
+| --- | --- | --- |
+| 서버 | **Raspberry Pi 4 (4GB)** 이상 | 수집·전처리 전용이므로 충분. Pi 5 / 미니PC로 교체 가능 |
+| 부팅 | MicroSD **High Endurance 등급** | 여분 카드 1장 필수. 세팅 완료 후 전체 이미지 백업 |
+| 데이터 | USB 3.0 외장 SSD/HDD | **DB·미디어는 반드시 SD 밖에 배치** (SD 수명 보호) |
+| 냉각 | 방열판 + 팬 | 24/7 운용 |
+| 전원 | 소형 UPS (권장) | 정전 시 DB 손상 방지 |
+
+### 소프트웨어
+
+| 구분 | 선택 | 비고 |
+| --- | --- | --- |
+| OS | Ubuntu Server 24.04 LTS (64-bit, 헤드리스) | `snapd` 제거로 RAM 확보 |
+| 인프라 | Docker & Docker Compose | 앱 격리 · 서버 이전 용이 |
+| DB | PostgreSQL + pgvector | 메타데이터 + RAG 임베딩 |
+| 백엔드 | Python FastAPI | BackgroundTasks 사용 (Celery/Redis 미사용) |
+| 프론트 | Next.js (standalone 빌드) | **빌드는 PC에서 수행 후 배포** |
+| 네트워크 | Tailscale 또는 Cloudflare Tunnel | |
+
+### 저사양(SD카드) 운용 지침
+
+- PostgreSQL 데이터 디렉토리와 미디어 저장소를 USB 저장장치로 이전
+- `/var/log` → tmpfs (log2ram), 스왑 비활성화, `noatime` 마운트
+- Next.js는 PC에서 빌드 후 결과물만 배포 (Pi에서 빌드 금지)
+- 동영상 트랜스코딩 금지. 원본 보존 + 오디오 추출만 수행
+- ffmpeg 변환·백업은 새벽 배치로 분산
+
+---
+
+## 3. 정보 구조 (사람이 보는 계층)
+
+일반적인 아카이브 사이트의 문법을 따른다.
+
+### 브라우징 축
+
+| 축 | 내용 |
+| --- | --- |
+| 인물별 | 구성원 프로필 → 해당 인물의 모든 기록 |
+| 연도별 | 타임라인. 연도별 자료 밀도 시각화 |
+| 유형별 | 텍스트 / 이미지 / 동영상 / 음성 |
+| 컬렉션별 | "할머니 구술사", "1985 제주 여행" 등 큐레이션 묶음 |
+| 검색 | 키워드 + 의미 검색(pgvector) |
+
+### 주요 화면
+
+1. **홈 / 타임라인** — 연도축 위에 자료 밀도와 최근 업로드 표시
+2. **인물 페이지** — 프로필, 대표 사진, 관련 기록, 수집 현황
+3. **컬렉션 페이지** — 하나의 사건·세션으로 묶인 자료 묶음
+4. **상세 페이지** — 미디어 뷰어 + 전사문 + 태그 + 원본 다운로드
+5. **업로드 화면** — 드래그앤드롭 + 최소 태깅 (아래 5절)
+6. **데일리 인터뷰** — 매일/매주 질문 제시 → 음성 또는 텍스트 답변
+7. **어드민** — 수집 현황 대시보드, 화자 태깅 작업대, 데이터셋 Export
+
+---
+
+## 4. 데이터 모델
 
 ```sql
--- 1. 화자 (가족 구성원)
-CREATE TABLE speakers (
-    speaker_id  VARCHAR(30) PRIMARY KEY,   -- ex: 'father_01'
-    name        VARCHAR(50) NOT NULL,
-    relation    VARCHAR(30),               -- ex: '아빠', '엄마', '할머니'
-    traits      JSONB,                     -- 말투 특성, 자주 쓰는 단어, 성격 요약
-    consent_at  TIMESTAMP                  -- AI 학습 동의 시각 (필수)
+-- 1. 구성원
+CREATE TABLE members (
+    member_id    VARCHAR(30) PRIMARY KEY,   -- 'grandma_01'
+    name         VARCHAR(50) NOT NULL,
+    relation     VARCHAR(30),               -- '할머니', '아빠'
+    birth_year   INT,
+    traits       JSONB,                     -- 말투 특성, 자주 쓰는 표현, 성격 요약
+    ai_consent   BOOLEAN DEFAULT FALSE,     -- AI 학습 동의 여부
+    consent_at   TIMESTAMP
 );
 
--- 2. 통합 아카이브
+-- 2. 컬렉션 (사건/세션 단위 묶음)
+CREATE TABLE collections (
+    collection_id BIGSERIAL PRIMARY KEY,
+    title         VARCHAR(200) NOT NULL,    -- '2026 설날 할머니 인터뷰'
+    description   TEXT,
+    occurred_at   DATE,
+    location      VARCHAR(100)
+);
+
+-- 3. 아카이브 항목
 CREATE TABLE archive_items (
     id             BIGSERIAL PRIMARY KEY,
-    speaker_id     VARCHAR(30) REFERENCES speakers(speaker_id),
-    media_type     VARCHAR(10) NOT NULL,   -- 'audio' | 'text' | 'image' | 'video'
-    file_path      TEXT NOT NULL,
-    raw_content    TEXT,                   -- 원문 또는 STT 대본
+    collection_id  BIGINT REFERENCES collections(collection_id),
+    member_id      VARCHAR(30) REFERENCES members(member_id),  -- 주 화자/피사체
+    media_type     VARCHAR(10) NOT NULL,    -- 'text'|'image'|'video'|'audio'
+    file_path      TEXT NOT NULL,           -- 원본 경로
+    title          VARCHAR(200),
+    raw_content    TEXT,                    -- 원문 또는 STT 전사문
 
-    -- AI 데이터 생성용 태그
-    emotion        VARCHAR(20),            -- 'joy' | 'sadness' | 'calm' | 'serious'
-    target_person  VARCHAR(30),            -- 대화 상대 (ex: '딸에게')
-    speech_style   VARCHAR(30),            -- 'casual' | 'formal' | 'dialect'
+    -- 공통 태그 (아카이브 브라우징 + 학습 메타데이터 겸용)
+    people         VARCHAR(30)[],           -- 등장 인물 다중 태그
+    location       VARCHAR(100),
+    recorded_at    TIMESTAMP,               -- 실제 기록 시점 (EXIF 또는 수동)
 
-    -- STT 처리 이력
-    stt_engine     VARCHAR(40),            -- 'groq-whisper-large-v3' | 'whispercpp-small'
-    stt_confidence REAL,                   -- 저품질 대본 선별 재처리용
-    local_only     BOOLEAN DEFAULT FALSE,  -- TRUE: 외부 API 전송 금지 (민감 데이터)
+    -- 페르소나 태그
+    emotion        VARCHAR(20),             -- 'joy'|'sadness'|'calm'|'serious'
+    target_person  VARCHAR(30),             -- 대화 상대 ('손주에게')
+    speech_style   VARCHAR(30),             -- 'casual'|'formal'|'dialect'
 
-    -- RAG용 벡터 (임베딩 모델 확정 후 차원 결정: OpenAI 1536 / BGE-M3 1024)
-    embedding      vector(1536),
+    -- 처리 이력
+    stt_engine     VARCHAR(40),             -- 'groq-whisper-large-v3'|'whispercpp-small'
+    stt_confidence REAL,
+    local_only     BOOLEAN DEFAULT FALSE,   -- TRUE: 외부 API 전송 금지 (민감)
 
-    recorded_at    TIMESTAMP,              -- 실제 기록된 과거 날짜 (EXIF 또는 지정)
+    -- 학습 적격 상태 (5절 참조)
+    ai_status      VARCHAR(20) DEFAULT 'pending',
+                   -- 'ready' | 'pending' | 'excluded'
+    ai_exclude_reason VARCHAR(50),          -- 'no_speaker_tag'|'low_quality'|'user_opt_out'
+
+    embedding      vector(1024),            -- 임베딩 모델 확정 후 차원 조정
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. 발화 세그먼트 (음성/동영상 전사 결과. 화자 태깅 단위)
+CREATE TABLE utterances (
+    utterance_id  BIGSERIAL PRIMARY KEY,
+    item_id       BIGINT REFERENCES archive_items(id),
+    member_id     VARCHAR(30) REFERENCES members(member_id),  -- NULL이면 미태깅
+    seq           INT NOT NULL,             -- 대화 순서
+    start_sec     REAL,
+    end_sec       REAL,
+    text          TEXT NOT NULL,
+    clip_path     TEXT,                     -- 분할 WAV 클립 (학습용)
+    confidence    REAL
 );
 ```
 
----
+### 학습 적격 상태 (`ai_status`)
 
-## 4. 자동 전처리 파이프라인
+| 값 | 의미 |
+| --- | --- |
+| `ready` | 화자 확정 + 품질 기준 충족. 데이터셋에 포함 |
+| `pending` | 아카이브에는 보이나 학습 불가. 화자 미태깅, 검수 대기 등 |
+| `excluded` | 영구 제외. 본인 요청, 품질 미달, 민감 기록 |
 
-### ① 음성 (Voice Pipeline)
-
-```
-[업로드] → [ffmpeg 변환] → [Silero VAD 발화 검출] → [STT 라우팅] → [클립 분할] → [DB 기록]
-                │                                       │
-                ├─ 원본 보존 (raw_archives)              ├─ 기본: Groq API (whisper-large-v3)
-                └─ STT 전송용 16kHz mono 임시 파일       │        language="ko", verbose_json
-                                                        └─ 폴백: 로컬 whisper.cpp (Small)
-                                                                 · API 장애/한도 소진 시
-                                                                 · local_only 플래그 지정 시
-```
-
-1. **포맷 변환:** 원본은 무압축 보존, STT 전송용으로 16kHz/16bit/Mono WAV 임시 생성 (Whisper 네이티브 스펙 — 정확도·전송속도 개선).
-2. **VAD:** Silero VAD로 발화 경계 검출. `speech_pad_ms` 300~400ms로 첫 음절 잘림 방지.
-3. **STT:** Groq API 우선 (무료 티어: 일 2,000건 / 28,800초 — 조건 변동 가능, 분기별 재확인). 429 시 지수 백오프, 연속 실패 시 로컬 폴백 → 야간 배치 처리.
-4. **클립 분할:** Whisper 타임스탬프 × VAD 경계 교차 검증으로 2~10초 분할. 파일명 `{speaker_id}_{0001}.wav`.
-5. **DB 기록:** 대본·엔진·신뢰도를 DB에만 기록. CSV는 Export 시 생성.
-
-### ② 텍스트 (LLM Pipeline)
-
-1. 웹 UI에서 [질문-답변] 또는 [일기/자유글] 작성.
-2. DB에 원문 저장. Export 시 표준 파인튜닝 JSONL로 변환:
-
-```json
-{"messages": [{"role": "user", "content": "아빠가 가장 보람찼던 순간은 언제야?"}, {"role": "assistant", "content": "너희들이 건강하게 자라줘서 각자 꿈을 찾아갈 때였지."}]}
-```
-
-### ③ 이미지 (LoRA Pipeline)
-
-1. 업로드 시 EXIF에서 날짜 추출 → `recorded_at`.
-2. **캡셔닝은 라즈베리파이에서 하지 않는다.** 다음 중 택일:
-   - (a) 업로드 시 웹 UI에서 가족이 간단 수동 태깅
-   - (b) Export 직전 클라우드 GPU/비전 API에서 일괄 자동 캡셔닝
-3. Export 시 이미지 + 동명 `.txt` 캡션 쌍으로 출력.
+> **원칙:** 학습에 못 쓰는 자료도 아카이브에는 남는다. 화자 태깅이 안 된 대화 녹음도 **RAG 검색용으로는 그대로 유용**하다.
 
 ---
 
-## 5. 백업 전략 (Phase 1 필수 요소)
+## 5. 업로드 및 전처리 파이프라인
+
+### 업로드 시 요구하는 입력 (최소화 원칙)
+
+필수는 **누가(인물)** 와 **언제(연도)** 뿐. 나머지는 나중에 보완 가능하도록 `pending` 처리한다.
+
+- 인물 선택 (다중)
+- 시점 (이미지·동영상은 EXIF/메타데이터에서 자동 추출, 없으면 입력)
+- 컬렉션 지정 (선택, 새로 만들기 가능)
+- `민감(로컬 전용)` 토글
+
+### ① 음성 (Audio)
+
+```
+[업로드] → [원본 보존] → [16kHz mono 임시 변환] → [Silero VAD]
+   → [STT: Groq whisper-large-v3 (폴백: whisper.cpp)]
+   → [utterances 테이블에 세그먼트 저장] → [화자 태깅 대기]
+```
+
+- 원본은 무압축 그대로 `raw_archives/`에 보존
+- VAD `speech_pad_ms` 300~400ms로 첫 음절 잘림 방지
+- **단독 녹음**(1인 인터뷰): 화자 자동 확정 → `ai_status = ready`
+- **대화 녹음**(다인): 화자 미상 → `pending`. 어드민 화자 태깅 작업대에서 문장별로 인물 지정
+- `local_only` 항목은 외부 API 전송 금지, 로컬 whisper.cpp로만 처리
+
+### ② 동영상 (Video)
+
+```
+[업로드] → [원본 보존(트랜스코딩 없음)] → [ffmpeg로 오디오 트랙 추출]
+   → [음성 파이프라인으로 위임] → [썸네일 프레임 추출]
+```
+
+- 동영상은 세 가지 자산의 결합체: 음성(→STT/음성학습) + 프레임(→얼굴/아바타 학습) + 영상 자체(→감상용)
+- Pi 4에서는 **트랜스코딩하지 않는다.** 오디오 추출과 썸네일 생성만 수행
+- 프레임 단위 인물 추출은 향후 아바타 학습 단계에서 별도 처리
+
+### ③ 이미지 (Image)
+
+```
+[업로드] → [EXIF 추출(날짜·위치)] → [썸네일 생성] → [인물 태깅]
+```
+
+- **자동 캡셔닝은 서버에서 하지 않는다.** 업로드 시 간단 수동 태깅 또는 Export 직전 클라우드 일괄 처리
+- 태그(인물·연도·장소·상황)가 그대로 LoRA 캡션 재료가 됨
+
+### ④ 텍스트 (Text)
+
+```
+[웹 입력 또는 파일 업로드] → [본문 저장] → [임베딩 생성] → [태깅]
+```
+
+- 데일리 인터뷰의 [질문–답변] 형태는 질문이 DB에 이미 있으므로 **user/assistant 짝이 자동 완성**됨 (LLM 학습에 가장 이상적인 형태)
+- 일기·편지 등 자유글은 화자 발화 코퍼스로 활용
+
+---
+
+## 6. 저장 구조
+
+```
+/data/                              ← USB 저장장치 (SD카드 아님)
+├── raw_archives/                   # 무압축 원본 = 유일한 마스터
+│   ├── audio/  images/  video/  text/
+├── derived/                        # 재생성 가능한 파생물
+│   ├── clips/                      #   발화 단위 분할 WAV
+│   ├── thumbnails/
+│   └── audio_from_video/
+├── exports/                        # 학습용 데이터셋 (Export 시 생성)
+│   ├── voice_{member}/             #   프리셋별 WAV + metadata.csv
+│   ├── llm_{member}.jsonl
+│   └── lora_{member}/              #   이미지 + .txt 캡션 쌍
+└── pg_data/                        # PostgreSQL 데이터 디렉토리
+```
+
+---
+
+## 7. 데이터셋 Export (기계가 읽는 계층)
+
+어드민에서 구성원을 선택하고 용도별로 내보낸다. `ai_status = ready` 항목만 포함된다.
+
+| 용도 | 산출물 | 구성 |
+| --- | --- | --- |
+| 음성 클로닝 | `voice_{member}.zip` | 프리셋별 WAV(32kHz/24kHz) + `metadata.csv` |
+| LLM 파인튜닝 | `llm_{member}.jsonl` | `{"messages":[{"role":"user",...},{"role":"assistant",...}]}` |
+| 이미지 LoRA | `lora_{member}.zip` | 이미지 + 동명 `.txt` 캡션 |
+| RAG | `rag_{member}.json` | 전사문 + 메타데이터 + 임베딩 |
+
+- Export 시 원본에서 대상 프리셋 샘플레이트로 재변환
+- `stt_confidence` 임계값 미만 클립은 제외 또는 경고 표시
+
+### 수집 현황 대시보드
+
+어드민에 구성원별로 다음을 표시하여 **"언제 페르소나를 만들 수 있는가"**를 가늠한다.
+
+- 학습 가능 음성 총 길이 (목표: 30분~1시간)
+- Q&A 쌍 개수 (목표: 500~1,000턴)
+- 인물 사진 장수 (목표: 20~50장)
+- 감정 태그별 분포 (부족한 감정은 데일리 인터뷰 질문으로 유도)
+- 화자 태깅 대기 항목 수
+
+---
+
+## 8. 백업
 
 | 계층 | 방법 | 주기 |
 | --- | --- | --- |
-| 오프사이트 (기본) | rclone **crypt** → Google Drive (Google One 용량 요금제 확인) | 매일 야간 |
-| 로컬 (확장) | 데이터 수십 GB 초과 시 외장 HDD(rsync/borg) 추가 | 매일 야간 |
-| DB | `pg_dump` 덤프를 위 백업에 포함 | 매일 야간 |
+| 오프사이트 (기본) | rclone **crypt** → Google Drive | DB 하루 2~3회 / 미디어는 업로드 직후 |
+| 로컬 (확장) | 데이터 수십 GB 초과 시 외장 HDD 추가 | 매일 야간 |
+| 시스템 | SD카드 전체 이미지 백업 | 세팅 완료 시 + 주요 변경 시 |
 
-### Google Drive 백업 운용 규칙
-
-- **암호화 필수:** rclone `crypt` 리모트로 파일명 포함 클라이언트 측 암호화. 암호화 비밀번호는 서버 외부(종이/패스워드 매니저)에 별도 보관 — 분실 시 백업 전체 복원 불가.
-- **아카이브 후 업로드:** 작은 파일 수천 개를 개별 업로드하지 않는다. 야간 배치에서 `raw_archives/` 증분 + `pg_dump`를 날짜별 `tar.zst`로 묶어 큰 파일 단위로 업로드 (API 레이트 리밋 회피).
-- **헤드리스 인증:** PC에서 `rclone config`로 OAuth 토큰 발급 후 라즈베리파이의 `~/.config/rclone/rclone.conf`로 복사.
-- 백업 대상: `raw_archives/`, `trained_models/`, DB 덤프. (`ai_processed/`는 재생성 가능하므로 제외)
-- 월 1회 복원 테스트로 백업 유효성 검증. 계정 잠금 리스크에 대비해 데이터가 커지면 로컬 HDD 계층을 추가한다.
+- **암호화 필수.** rclone `crypt`로 파일명까지 클라이언트 측 암호화. 비밀번호는 서버 외부에 별도 보관 (분실 시 복원 불가)
+- 작은 파일 다수를 개별 업로드하지 않는다. 날짜별 `tar.zst`로 묶어 업로드 (API 레이트 리밋 회피)
+- 헤드리스 인증: PC에서 `rclone config`로 토큰 발급 후 `~/.config/rclone/rclone.conf` 복사
+- 백업 대상: `raw_archives/`, `pg_dump`. (`derived/`, `exports/`는 재생성 가능)
+- **월 1회 복원 테스트**로 유효성 검증
 
 ---
 
-## 6. 구축 로드맵
+## 9. 구축 로드맵
 
 ```
-[Phase 1: 인프라+백업] → [Phase 2: DB & 파이프라인] → [Phase 3: 웹 UI] → [Phase 4: Export] → [Phase 5: 클로닝 학습]
+[Phase 1: 인프라·백업] → [Phase 2: DB·업로드·전처리] → [Phase 3: 아카이브 UI]
+   → [Phase 4: 태깅·Export] → [향후: 페르소나 AI]
 ```
 
-### Phase 1 — 하드웨어 및 OS 인프라
-1. PCIe HAT + NVMe SSD 장착. Ubuntu Server 24.04 LTS (64-bit) 설치
-2. Pi 5 부트로더(EEPROM) 최신화 및 NVMe 부팅 순서 설정
-3. NVMe Gen3 활성화: `/boot/firmware/config.txt`에 `dtparam=pciex1_gen=3` 추가
-4. `sudo apt purge snapd` 등 불필요 서비스 제거 (RAM 확보)
-5. Docker & Docker Compose 설치
-6. Tailscale로 가족 전용 가상 폐쇄망 구축
-7. **백업 체계 구축 (rclone crypt → Google Drive, 야간 cron) — 이 단계에서 완료**
+### Phase 1 — 인프라 및 백업
+1. Ubuntu Server 24.04 LTS (헤드리스) 설치, `snapd` 제거
+2. USB 저장장치 마운트, `/data` 구조 생성, log2ram·noatime·스왑off 적용
+3. Docker & Docker Compose 설치
+4. Tailscale로 가족 전용 폐쇄망 구축
+5. **rclone crypt → Google Drive 백업 자동화 및 복원 테스트**
+6. SD카드 전체 이미지 백업 보관
 
-### Phase 2 — DB 및 전처리 모듈
-1. Docker Compose로 PostgreSQL(+pgvector) 실행
-2. ffmpeg / Silero VAD 세팅, whisper.cpp 빌드 (폴백용)
-3. FastAPI 백엔드: 업로드 API, Groq STT 연동(+백오프/폴백 라우팅), 클립 분할 모듈
-4. Groq API 키는 `.env` + Docker secret으로 관리
+### Phase 2 — DB 및 수집 파이프라인
+1. PostgreSQL + pgvector 컨테이너 기동, 스키마 적용
+2. ffmpeg / Silero VAD 세팅, whisper.cpp 빌드(폴백용)
+3. FastAPI: 업로드 API, 미디어 타입별 라우팅, STT 연동(백오프·폴백), 세그먼트 분할
+4. Groq API 키는 `.env` + Docker secret 관리
 
-### Phase 3 — 웹 UI (Next.js)
-- **데일리 인터뷰:** 매일/매주 질문 → 음성 녹음 또는 텍스트 답변
-  - 녹음 가이드 배너: "조용한 곳에서 / 마이크 30cm 이내 / 평소 말하듯"
-  - 업로드 시 SNR 간이 측정 → 미달 시 재녹음 안내
-- **페르소나 태깅 입력폼:** 어조·감정·대화 상대 터치 태그 + `민감(로컬 전용)` 토글
-- **감정 다양성 대시보드:** 감정별 수집 분포 표시, 부족한 감정 유도 질문 자동 배치
-- **인생 타임라인:** 연도별 사진·음성 데이터 밀도 시각화
-- **동의 기록:** 화자 최초 등록 시 AI 학습 동의 항목 (DB 저장)
+### Phase 3 — 아카이브 사이트 UI
+1. Next.js 기본 레이아웃 + 인증(가족 계정)
+2. 업로드 화면 (드래그앤드롭, 최소 태깅, EXIF 자동 추출)
+3. 브라우징: 타임라인 / 인물 / 유형 / 컬렉션 / 검색
+4. 상세 페이지: 미디어 뷰어 + 전사문 + 태그 편집
+5. 데일리 인터뷰 화면 (질문 제시 → 녹음/텍스트 답변)
+   - 녹음 가이드: "조용한 곳에서 / 마이크 30cm 이내 / 평소 말하듯"
+   - 업로드 시 SNR 간이 측정 → 미달 시 재녹음 안내
 
-### Phase 4 — Export
-- 어드민 [AI 데이터셋 내보내기]: 화자 선택 → 용도별 출력
-  - Voice: 모델 프리셋(32kHz/24kHz) 선택 → WAV + metadata.csv ZIP
-  - LLM: `train_{speaker}.jsonl`
-  - LoRA: 이미지 + `.txt` 캡션 쌍
-- `stt_confidence` 임계값 미만 클립은 제외 또는 경고 표시
+### Phase 4 — 태깅 도구 및 Export
+1. 화자 태깅 작업대: 전사 세그먼트 목록에 인물을 터치로 지정
+2. 수집 현황 대시보드
+3. 용도별 데이터셋 Export 구현
+4. `ai_status` 일괄 관리 도구
 
-### Phase 5 — 음성 클로닝 학습 및 운용
-1. **2단계 전략:** 제로샷(5초 샘플)으로 품질 사전 검증 → 데이터 30분+ 축적 시 파인튜닝
-2. **모델:** GPT-SoVITS 1순위 (한국어 공식 지원, 1분 데이터부터 가능, MIT). 예비: Fish Speech(Apache 2.0), XTTS-v2(비상업), CosyVoice 2. 착수 전 최신 동향 재확인.
-3. **학습:** RunPod RTX 4090 (~$0.4~0.7/hr) + GPT-SoVITS WebUI → SoVITS 모듈 → GPT 모듈 순차 학습 → 테스트 문장 검수 → 가중치 회수 → 인스턴스 즉시 종료 (1회 ~$1 내외)
-4. **보관:** `trained_models/`에 버전 누적 (삭제 금지) + `training_manifest.json`으로 재현성 확보
-5. **추론 운용:** (A) 자주 쓸 문장 사전 생성 → (B) 필요 시 온디맨드 GPU → (C) 추후 가정 내 GPU 추론 서버 (LLM 페르소나 실시간 연동 단계)
+### 향후 — 페르소나 AI (별도 환경)
+- **말투**: 대화 데이터 LoRA 파인튜닝 → "그 사람처럼 말한다"
+- **기억**: pgvector RAG → **실제 기록에 근거한 답변만 생성** (환각 방지의 핵심)
+- **목소리**: GPT-SoVITS 등으로 클로닝 (30분~1시간 데이터)
+- 학습은 클라우드 GPU(RunPod 등), 추론은 별도 로컬 머신 또는 온디맨드 GPU
+- 본 서버는 이 단계에서도 **데이터 공급원 역할만** 수행한다
 
 ---
 
-## 7. 윤리 및 동의
+## 10. 윤리 및 동의
 
-- 클로닝 대상 본인의 **명시적 동의를 사전에 기록**한다 (`speakers.consent_at`).
-- 고인 대비 아카이브 성격이라면 **생전에 본인 의사를 확인**해 가족 간 갈등을 예방한다.
-- 학습 모델과 생성 음성은 가족 내부 용도로 한정. 외부 공유 시 본인(또는 유족 전원) 합의 필요.
-- 생성 음성에는 메타데이터로 "AI 생성" 표시를 남겨 실제 녹음과 구분한다.
-- 민감한 녹음(유언·재산·건강 등)은 `local_only` 플래그로 외부 API 전송을 차단한다.
+- **사전 동의 필수.** 구성원 등록 시 AI 학습 활용 동의를 명시적으로 받고 기록한다 (`members.ai_consent`).
+- 고인을 대비한 아카이브라면 **생전에 본인 의사를 확인**한다. 이 대화 자체가 가장 값진 기록이 되는 경우가 많다.
+- 민감한 기록(유언·재산·건강 등)은 `local_only`로 외부 API 전송을 차단한다.
+- 생성된 AI 음성·텍스트에는 **"AI 생성" 표시**를 남겨 실제 기록과 구분한다.
+- 페르소나 AI는 **"그 사람의 대체물"이 아니라 "그 사람이 남긴 이야기에 접근하는 도구"**로 규정한다.
+- 외부 공유·공개는 본인(또는 유족 전원) 합의를 거친다.
 
 ---
 
-## 8. 운영 체크리스트
+## 11. 운영 체크리스트
 
-- [ ] 백업 자동화(rclone crypt→Google Drive) + 월 1회 복원 테스트
+- [ ] 백업 자동화 + 월 1회 복원 테스트
 - [ ] rclone crypt 비밀번호 오프라인 별도 보관
-- [ ] Google One 용량 잔여분 분기별 확인 / 수십 GB 초과 시 외장 HDD 계층 추가
+- [ ] SD카드 여분 확보 및 이미지 백업 최신화
+- [ ] Google Drive 잔여 용량 분기별 확인
 - [ ] Groq 데이터 정책 확인 및 가족 공지, 무료 티어 조건 분기별 재확인
-- [ ] `stt_confidence` 하위 항목 월간 리포트 → 재전사 여부 결정
-- [ ] 임베딩 모델 확정 (OpenAI 1536 vs BGE-M3 1024) 후 vector 차원 반영
-- [ ] 데이터 1~5분: 제로샷 테스트 / 30분+: 1차 파인튜닝
-- [ ] 학습 후 GPU 인스턴스 종료 확인
-- [ ] 분기별 재학습 여부 결정
+- [ ] 임베딩 모델 확정 후 `vector()` 차원 반영
+- [ ] 화자 태깅 대기 항목 월간 정리
+- [ ] `stt_confidence` 하위 항목 검토 및 재전사 여부 결정
+- [ ] 구성원별 AI 학습 동의 기록 확보
+
+---
+
+## 12. 무엇보다 먼저
+
+시스템은 나중에 얼마든지 고도화할 수 있지만, **기록할 기회는 지나가면 돌아오지 않습니다.**
+서버가 완성되기를 기다리지 말고, 오늘 스마트폰 음성 메모로 30분을 녹음하세요.
+그 파일은 어떤 하드웨어를 쓰든, 어떤 모델이 나오든 그대로 쓸 수 있습니다.
