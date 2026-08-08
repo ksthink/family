@@ -9,6 +9,7 @@
 
 > 📐 **설계 문서:** [구성 요소별 설계 명세](docs/설계_명세.md) — 요소별 핵심 원칙·기능·내용
 > 🗂 **데이터셋:** [데이터셋 구성 가이드](docs/데이터셋_구성.md) — 생성 과정과 저장 형식 예시
+> 🗃 **분류:** [자료 분류체계](docs/자료_분류체계.md) — 문헌형식 20종과 Export 매핑
 > 📤 **가족용 사용 안내:** [자료 올리기 안내](docs/업로드_안내.md)
 > 🔐 **운영자용:** [Google Drive 백업 설정](docs/백업_설정.md)
 
@@ -175,7 +176,18 @@ CREATE TABLE archive_items (
     creator_id     VARCHAR(30) REFERENCES members(member_id),
     subject_ids    VARCHAR(30)[],
 
-    media_type     VARCHAR(10) NOT NULL,    -- 'text'|'image'|'video'|'audio'
+    media_type     VARCHAR(10) NOT NULL,    -- 파일 형식: 'text'|'image'|'video'|'audio'
+
+    -- 문헌형식: 자료의 성격 (스캔한 편지는 형식상 image지만 성격은 letter)
+    -- 20종 전체 목록과 근거는 docs/자료_분류체계.md 참조
+    doc_type       VARCHAR(20),             -- diary|letter_sent|writing|interview|
+                                            -- oral_history|vital|education|award|
+                                            -- official|financial|medical|letter_recv|
+                                            -- media|about|photo|av|ephemera|object|
+                                            -- genealogy|ritual
+    doc_type_by    VARCHAR(10) DEFAULT 'auto',  -- 'auto'(추정) | 'user'(확인)
+    verified_date  DATE,                    -- 증빙 자료에서 확인된 확정 일자 (연표 기준점)
+
     file_path      TEXT NOT NULL,           -- 원본 경로
     title          VARCHAR(200),
     raw_content    TEXT,                    -- 원문 또는 STT 전사문
