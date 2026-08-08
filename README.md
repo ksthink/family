@@ -133,6 +133,7 @@ CREATE TABLE archive_items (
 
     -- 공통 태그 (아카이브 브라우징 + 학습 메타데이터 겸용)
     people         VARCHAR(30)[],           -- 등장 인물 다중 태그
+    people_tagged_by VARCHAR(10) DEFAULT 'user', -- 'user'(사람 확인) | 'auto'(얼굴인식 추정)
     location       VARCHAR(100),
     recorded_at    TIMESTAMP,               -- 실제 기록 시점 (EXIF 또는 수동)
 
@@ -166,6 +167,34 @@ CREATE TABLE utterances (
     text          TEXT NOT NULL,
     clip_path     TEXT,                     -- 분할 WAV 클립 (학습용)
     confidence    REAL
+);
+
+-- 5. 얼굴 기준 벡터 (구성원별 다중 등록. 연령대별로 나눠 관리)
+CREATE TABLE face_references (
+    ref_id       BIGSERIAL PRIMARY KEY,
+    member_id    VARCHAR(30) REFERENCES members(member_id),
+    era_label    VARCHAR(30),              -- '1960s'|'1990s'|'current' 등 연령대 구분
+    embedding    vector(512),              -- InsightFace 등 얼굴 임베딩
+    source_item  BIGINT REFERENCES archive_items(id),  -- 이 벡터를 얻은 원본 사진
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX ON face_references USING hnsw (embedding vector_cosine_ops);
+
+-- 6. 사진/영상에서 검출된 얼굴
+CREATE TABLE face_detections (
+    face_id      BIGSERIAL PRIMARY KEY,
+    item_id      BIGINT REFERENCES archive_items(id),
+    bbox         INT[4],                   -- [x, y, w, h]
+    embedding    vector(512),
+    crop_path    TEXT,                     -- 얼굴 크롭 이미지 (향후 LoRA/아바타 자산)
+    frame_sec    REAL,                     -- 동영상인 경우 해당 프레임 시각
+
+    -- 매칭 결과
+    suggested_member VARCHAR(30) REFERENCES members(member_id),
+    similarity   REAL,                     -- 기준 벡터와의 코사인 유사도
+    confirmed_member VARCHAR(30) REFERENCES members(member_id),  -- 사람이 확정한 값
+    status       VARCHAR(15) DEFAULT 'pending'
+                 -- 'confirmed' | 'suggested' | 'pending' | 'rejected'
 );
 ```
 
@@ -220,11 +249,45 @@ CREATE TABLE utterances (
 ### ③ 이미지 (Image)
 
 ```
-[업로드] → [EXIF 추출(날짜·위치)] → [썸네일 생성] → [인물 태깅]
+[업로드] → [EXIF 추출(날짜·위치)] → [썸네일 생성]
+   → [얼굴 검출·임베딩 (InsightFace)] → [기준 벡터와 매칭] → [인물 태그 제안]
 ```
 
 - **자동 캡셔닝은 서버에서 하지 않는다.** 업로드 시 간단 수동 태깅 또는 Export 직전 클라우드 일괄 처리
 - 태그(인물·연도·장소·상황)가 그대로 LoRA 캡션 재료가 됨
+- 얼굴 인식 상세는 [5.5절](#55-얼굴-인식-기반-인물-태그-제안) 참조
+
+### 5.5 얼굴 인식 기반 인물 태그 제안
+
+업로드 시 가장 번거로운 "나온 사람 모두 선택"을 줄이기 위해, 검출된 얼굴을 구성원 기준 벡터와 대조해 태그를 **제안**한다.
+
+**모델:** InsightFace `buffalo_s` (ONNX Runtime, CPU). Pi 4에서 사진 1장당 약 1~3초. 업로드 후 백그라운드 처리이므로 지연은 문제되지 않는다. 벡터 검색은 기존 pgvector를 그대로 사용한다.
+
+**핵심 원칙 — 자동 태깅이 아니라 제안이다.**
+
+| 유사도 | 동작 |
+| --- | --- |
+| 높음 (≈0.6 이상) | 해당 인물을 **미리 체크된 상태**로 제안. 사용자는 확인만 |
+| 애매 | "○○님인가요?" 확인 요청 |
+| 낮음 / 미매칭 | 얼굴 박스만 표시하고 인물 선택 요청 |
+
+- 사용자가 확인·수정하면 그 벡터를 `face_references`에 추가하여 정확도가 누적 개선된다.
+- `people_tagged_by='auto'` 인 항목은 **`ai_status`를 `ready`로 승격하지 않는다.** 사람이 확인한 태그만 학습 데이터셋에 포함한다.
+
+**이 프로젝트 특유의 난점과 대응**
+
+| 난점 | 대응 |
+| --- | --- |
+| **나이 변화** — 20대와 80대 얼굴은 벡터 거리가 멂 | 한 인물에 **연령대별 기준 벡터를 다중 등록** (`face_references.era_label`). 옛날 사진을 태깅할수록 해당 시대 정확도가 올라감 |
+| 오래된 사진의 화질 (흑백·스캔 노이즈·초점) | 검출 실패를 정상으로 간주. 수동 태깅으로 폴백 |
+| 가족 간 닮음 (부모-자식, 형제) | 임계값을 보수적으로 잡고 확인 절차를 반드시 거침 |
+
+**부수 효과**
+
+- 얼굴 크롭(`face_detections.crop_path`)이 자동으로 축적된다. 향후 **LoRA·아바타 학습 자산**으로 그대로 활용한다.
+- 동영상은 프레임을 일정 간격으로 샘플링해 동일 로직을 적용, 등장인물을 제안한다.
+
+**프라이버시:** 얼굴 임베딩은 생체정보에 해당한다. 전 과정을 로컬에서 처리하며 외부 API로 전송하지 않는다. 백업 시 rclone crypt 암호화 범위에 포함되는지 확인한다.
 
 ### ④ 텍스트 (Text)
 
@@ -324,7 +387,10 @@ CREATE TABLE utterances (
 2. 업로드 화면 (드래그앤드롭, 최소 태깅, EXIF 자동 추출)
 3. 브라우징: 타임라인 / 인물 / 유형 / 컬렉션 / 검색
 4. 상세 페이지: 미디어 뷰어 + 전사문 + 태그 편집
-5. 데일리 인터뷰 화면 (질문 제시 → 녹음/텍스트 답변)
+5. **얼굴 인식 인물 태그 제안** (사진 수백 장·수동 태깅 데이터가 쌓인 뒤 도입)
+   - InsightFace 백그라운드 워커, 구성원별 기준 얼굴 등록 화면
+   - 업로드 결과 화면에서 제안 태그 확인·수정 → 기준 벡터 자동 보강
+6. 데일리 인터뷰 화면 (질문 제시 → 녹음/텍스트 답변)
    - 녹음 가이드: "조용한 곳에서 / 마이크 30cm 이내 / 평소 말하듯"
    - 업로드 시 SNR 간이 측정 → 미달 시 재녹음 안내
 
@@ -363,6 +429,8 @@ CREATE TABLE utterances (
 - [ ] Groq 데이터 정책 확인 및 가족 공지, 무료 티어 조건 분기별 재확인
 - [ ] 임베딩 모델 확정 후 `vector()` 차원 반영
 - [ ] 화자 태깅 대기 항목 월간 정리
+- [ ] 얼굴 인식 제안 중 미확인(`status='suggested'`) 항목 월간 정리
+- [ ] 구성원별 연령대 기준 얼굴 벡터 보강 (옛날 사진 태깅 시)
 - [ ] `stt_confidence` 하위 항목 검토 및 재전사 여부 결정
 - [ ] 구성원별 AI 학습 동의 기록 확보
 
