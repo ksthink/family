@@ -8,6 +8,7 @@
 > 따라서 서버는 고사양일 필요가 없으며, 저전력 24시간 운용에 최적화합니다.
 
 > 📤 **가족용 사용 안내:** [자료 올리기 안내](docs/업로드_안내.md)
+> 🔐 **운영자용:** [Google Drive 백업 설정](docs/백업_설정.md)
 
 ---
 
@@ -357,7 +358,25 @@ CREATE TABLE face_detections (
 - 작은 파일 다수를 개별 업로드하지 않는다. 날짜별 `tar.zst`로 묶어 업로드 (API 레이트 리밋 회피)
 - 헤드리스 인증: PC에서 `rclone config`로 토큰 발급 후 `~/.config/rclone/rclone.conf` 복사
 - 백업 대상: `raw_archives/`, `pg_dump`. (`derived/`, `exports/`는 재생성 가능)
-- **월 1회 복원 테스트**로 유효성 검증
+- **월 1회 복원 테스트**로 유효성 검증 (`restore.sh verify` — 임시 DB에 덤프를 적용해 운영 DB를 건드리지 않고 확인)
+
+### 구현
+
+| 파일 | 역할 |
+| --- | --- |
+| `scripts/backup.sh` | `db` / `media` / `full` 모드. 중복 실행 방지(flock), 리모트 사전 점검, 로컬 덤프 보존 관리 |
+| `scripts/restore.sh` | `list` / `db` / `media` / `verify`. 재해 복구 및 정기 검증 |
+| `docs/백업_설정.md` | rclone crypt 설정, 헤드리스 인증, cron 등록, 복구 절차 |
+
+**cron 기본 구성**
+
+```cron
+0 13,21 * * *  backup.sh db      # DB 덤프 하루 3회
+0 3 * * *      backup.sh full    # 전체 백업 (새벽)
+0 4 1 * *      restore.sh verify # 월 1회 백업 검증
+```
+
+> `sync`가 아닌 `copy`를 사용한다. 로컬에서 실수로 파일을 삭제해도 원격 백업은 보존된다.
 
 ---
 
@@ -373,7 +392,9 @@ CREATE TABLE face_detections (
 2. USB 저장장치 마운트, `/data` 구조 생성, log2ram·noatime·스왑off 적용
 3. Docker & Docker Compose 설치
 4. Tailscale로 가족 전용 폐쇄망 구축
-5. **rclone crypt → Google Drive 백업 자동화 및 복원 테스트**
+5. **rclone crypt → Google Drive 백업 자동화** ([설정 가이드](docs/백업_설정.md))
+   - PC에서 OAuth 인증 → `rclone.conf` 서버 복사 → crypt 리모트 구성
+   - `backup.sh` 배치 및 cron 등록 → `restore.sh verify`로 복원 검증
 6. SD카드 전체 이미지 백업 보관
 
 ### Phase 2 — DB 및 수집 파이프라인
