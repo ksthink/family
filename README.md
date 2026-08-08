@@ -111,33 +111,82 @@ CREATE TABLE members (
     relation     VARCHAR(30),               -- '할머니', '아빠'
     birth_year   INT,
     traits       JSONB,                     -- 말투 특성, 자주 쓰는 표현, 성격 요약
-    ai_consent   BOOLEAN DEFAULT FALSE,     -- AI 학습 동의 여부
+
+    -- 입력 모드 (확장 대비)
+    input_mode   VARCHAR(10) DEFAULT 'proxy',  -- 'self'(본인 직접) | 'proxy'(가족 대리 수집)
+
+    -- AI 활용 동의 (단계별)
+    ai_consent   VARCHAR(20) DEFAULT 'none',
+                 -- 'none' | 'search'(검색·RAG만) | 'voice'(음성 합성까지) | 'persona'(대화형까지)
     consent_at   TIMESTAMP
 );
 
 -- 2. 컬렉션 (사건/세션 단위 묶음)
 CREATE TABLE collections (
     collection_id BIGSERIAL PRIMARY KEY,
-    title         VARCHAR(200) NOT NULL,    -- '2026 설날 할머니 인터뷰'
+    title         VARCHAR(200) NOT NULL,    -- '2026 설날 인터뷰' / '1962년 결혼'
     description   TEXT,
     occurred_at   DATE,
-    location      VARCHAR(100)
+    period_label  VARCHAR(30),              -- 날짜 미상 시 '1960년대 초' 등
+    location      VARCHAR(100),
+
+    -- 사건 단위로도 사용한다. 연결된 파일이 0건이어도 유효하다.
+    -- (인생의 중요한 사건 대부분은 남은 기록이 없다 → 이것이 곧 '수집 과제'가 된다)
+    kind          VARCHAR(15) DEFAULT 'session'
+                  -- 'session'(녹음·촬영 세션) | 'event'(생애 사건) | 'background'(인물·장소·조직)
+);
+
+-- 2-1. 구성원별 기억 (같은 사건도 사람마다 다르게 기억한다)
+CREATE TABLE memories (
+    memory_id     BIGSERIAL PRIMARY KEY,
+    collection_id BIGINT REFERENCES collections(collection_id),
+    member_id     VARCHAR(30) REFERENCES members(member_id),
+
+    narrative     TEXT,                     -- 이 사건에 얽힌 이야기 (자유 서술)
+
+    -- 감정의 이중 구조: 이 두 값의 간극이 그 사람의 해석 방식이다
+    emotion_then    VARCHAR(20),            -- 당시 감정: 고난|슬픔|분노|기쁨|사랑|행복|
+                                            --   즐거움|두려움|미안함|배신감
+    evaluation_now  VARCHAR(20),            -- 현재 평가: 성공|실패|후회|즐거움|슬픔|
+                                            --   고난|위기|기회
+    motive          VARCHAR(20),            -- 동기: 질투|사랑|분노|결핍|의무|인정|
+                                            --   연민|호기심|성취|우연  (선택 입력)
+    reason_then     TEXT,                   -- 당시 그렇게 느낀 이유
+    reason_now      TEXT,                   -- 지금 그렇게 평가하는 이유
+
+    -- 출처 구분: 본인 답변만 페르소나 학습에 사용한다
+    answered_by   VARCHAR(10) DEFAULT 'self',  -- 'self'(본인) | 'family'(가족 추정)
+
+    embedding     vector(1024),
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 3. 아카이브 항목
 CREATE TABLE archive_items (
     id             BIGSERIAL PRIMARY KEY,
     collection_id  BIGINT REFERENCES collections(collection_id),
-    member_id      VARCHAR(30) REFERENCES members(member_id),  -- 주 화자/피사체
+    memory_id      BIGINT REFERENCES memories(memory_id),      -- 연결된 기억 (없으면 NULL)
+
+    -- 생산자와 주제인물은 다르다.
+    --   creator  : 이 기록을 만들거나 말한 사람 → 페르소나 학습에 사용
+    --   subjects : 이 기록에 등장하는 사람들    → 아카이브 브라우징에 사용
+    -- 예) 할머니가 아빠 어린 시절을 회상한 녹음
+    --     → creator=할머니, subjects=[할머니, 아빠]. 아빠 페르소나 학습에는 쓰지 않는다.
+    creator_id     VARCHAR(30) REFERENCES members(member_id),
+    subject_ids    VARCHAR(30)[],
+
     media_type     VARCHAR(10) NOT NULL,    -- 'text'|'image'|'video'|'audio'
     file_path      TEXT NOT NULL,           -- 원본 경로
     title          VARCHAR(200),
     raw_content    TEXT,                    -- 원문 또는 STT 전사문
 
     -- 공통 태그 (아카이브 브라우징 + 학습 메타데이터 겸용)
-    people         VARCHAR(30)[],           -- 등장 인물 다중 태그
-    people_tagged_by VARCHAR(10) DEFAULT 'user', -- 'user'(사람 확인) | 'auto'(얼굴인식 추정)
+    subjects_tagged_by VARCHAR(10) DEFAULT 'user', -- 'user'(사람 확인) | 'auto'(얼굴인식 추정)
     location       VARCHAR(100),
+
+    -- 비전자 원본 (디지털화해도 실물은 남는다)
+    physical_location  VARCHAR(200),        -- '안방 장롱 위 상자'
+    physical_condition VARCHAR(10),         -- 'good'|'fair'|'poor' — poor는 우선 디지털화
     recorded_at    TIMESTAMP,               -- 실제 기록 시점 (EXIF 또는 수동)
 
     -- 페르소나 태그
@@ -275,7 +324,7 @@ CREATE TABLE face_detections (
 | 낮음 / 미매칭 | 얼굴 박스만 표시하고 인물 선택 요청 |
 
 - 사용자가 확인·수정하면 그 벡터를 `face_references`에 추가하여 정확도가 누적 개선된다.
-- `people_tagged_by='auto'` 인 항목은 **`ai_status`를 `ready`로 승격하지 않는다.** 사람이 확인한 태그만 학습 데이터셋에 포함한다.
+- `subjects_tagged_by='auto'` 인 항목은 **`ai_status`를 `ready`로 승격하지 않는다.** 사람이 확인한 태그만 학습 데이터셋에 포함한다.
 
 **이 프로젝트 특유의 난점과 대응**
 
